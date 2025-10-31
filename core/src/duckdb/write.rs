@@ -25,12 +25,14 @@ use datafusion::{
     logical_expr::Expr,
     physical_plan::{metrics::MetricsSet, DisplayAs, DisplayFormatType, ExecutionPlan},
 };
-use duckdb::Transaction;
+use duckdb::{Connection, Transaction};
 use futures::StreamExt;
 use snafu::prelude::*;
+use tokio::runtime::Handle;
 use tokio::sync::mpsc::{self, Receiver, Sender};
-use tokio::task::JoinHandle;
-
+use tokio::task;
+use tokio::task::{JoinHandle, JoinSet};
+use tokio_stream::wrappers::ReceiverStream;
 use super::creator::{TableDefinition, TableManager, ViewCreator};
 use super::{to_datafusion_error, RelationName};
 use super::write_settings::DuckDBWriteSettings;
@@ -445,8 +447,8 @@ fn insert_append(
         .context(super::DbConnectionPoolSnafu)
         .map_err(to_retriable_data_write_error)?;
 
-    let duckdb_conn = DuckDB::duckdb_conn(&mut db_conn).map_err(to_retriable_data_write_error)?;
-
+    let mut duckdb_conn = DuckDB::duckdb_conn(&mut db_conn).map_err(to_retriable_data_write_error)?;
+    let cxn = duckdb_conn.conn.try_clone().map_err(|e| DataFusionError::External(Box::new(e)))?;
     let tx = duckdb_conn
         .conn
         .transaction()
@@ -483,9 +485,11 @@ fn insert_append(
         "Append load for {table_name}",
         table_name = append_table.table_name()
     );
+
+
     let num_rows = write_to_table(
         &append_table,
-        &tx,
+        cxn,
         Arc::clone(&schema),
         batch_rx,
         on_conflict,
@@ -572,6 +576,7 @@ fn insert_overwrite(
 
     let duckdb_conn = DuckDB::duckdb_conn(&mut db_conn).map_err(to_retriable_data_write_error)?;
 
+    let cxn = duckdb_conn.conn.try_clone().unwrap();
     let tx = duckdb_conn
         .conn
         .transaction()
@@ -584,6 +589,14 @@ fn insert_overwrite(
 
     new_table
         .create_table(cloned_pool, &tx)
+        .map_err(to_retriable_data_write_error)?;
+
+    tx.commit().expect("foo");
+
+    let tx = duckdb_conn
+        .conn
+        .transaction()
+        .context(super::UnableToBeginTransactionSnafu)
         .map_err(to_retriable_data_write_error)?;
 
     let existing_tables = new_table
@@ -655,7 +668,8 @@ fn insert_overwrite(
     }
 
     tracing::debug!("Initial load for {}", new_table.table_name());
-    let num_rows = write_to_table(&new_table, &tx, Arc::clone(&schema), batch_rx, on_conflict)
+
+    let num_rows = write_to_table(&new_table, cxn, Arc::clone(&schema), batch_rx, on_conflict)
         .map_err(to_retriable_data_write_error)?;
 
     on_commit_transaction
@@ -717,34 +731,29 @@ fn insert_overwrite(
 /// Writes a stream of ``RecordBatch``es to a DuckDB table.
 fn write_to_table(
     table: &TableManager,
-    tx: &Transaction<'_>,
+    cxn: Connection,
     schema: SchemaRef,
-    data_batches: Receiver<RecordBatch>,
+    mut data_batches: Receiver<RecordBatch>,
     on_conflict: Option<&OnConflict>,
 ) -> datafusion::common::Result<u64> {
-    let stream = FFI_ArrowArrayStream::new(Box::new(RecordBatchReaderFromStream::new(
-        data_batches,
-        schema,
-    )));
+    let mut join_set = JoinSet::new();
+    let mut rows: u64 = 0;
 
-    let current_ts = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .context(super::UnableToGetSystemTimeSnafu)
-        .map_err(to_datafusion_error)?
-        .as_millis();
+    while let Some(batch) = data_batches.blocking_recv() {
+        rows += batch.num_rows() as u64;
 
-    let view_name = format!("__scan_{}_{current_ts}", table.table_name());
-    tx.register_arrow_scan_view(&view_name, &stream)
-        .context(super::UnableToRegisterArrowScanViewSnafu)
-        .map_err(to_datafusion_error)?;
+        let task_cxn = cxn.try_clone().map_err(|e| DataFusionError::External(e.into()))?;
+        let table = table.table_name().to_string();
+        join_set.spawn(async move {
+            let mut appender = task_cxn.appender(table.as_str()).unwrap();
+            appender.append_record_batch(batch).unwrap();
+            appender.flush().unwrap();
+        });
+    }
 
-    let view = ViewCreator::from_name(RelationName::new(view_name));
-    let rows = view
-        .insert_into(table, tx, on_conflict)
-        .map_err(to_datafusion_error)?;
-    view.drop(tx).map_err(to_datafusion_error)?;
+    task::block_in_place(|| Handle::current().block_on(join_set.join_all()));
 
-    Ok(rows as u64)
+    Ok(rows)
 }
 
 /// Executes an ANALYZE statement to update query optimizer statistics.
